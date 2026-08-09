@@ -8,7 +8,12 @@ import java.util.concurrent.Executors
 object NotificationPoster {
     private val executor = Executors.newSingleThreadExecutor()
 
-    fun post(context: Context, endpoint: String, secret: String, payload: TransactionPayload) {
+    fun post(
+        context: Context,
+        endpoint: String,
+        secret: String,
+        payload: TransactionPayload
+    ) {
         executor.execute {
             try {
                 val json = """
@@ -29,21 +34,35 @@ object NotificationPoster {
                     connectTimeout = 10000
                     readTimeout = 15000
                     doOutput = true
-                    setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                    setRequestProperty(
+                        "Content-Type",
+                        "application/json; charset=UTF-8"
+                    )
                 }
 
-                conn.outputStream.use { it.write(json.toByteArray(Charsets.UTF_8)) }
-                conn.inputStream.use { it.readBytes() }
+                conn.outputStream.use {
+                    it.write(json.toByteArray(Charsets.UTF_8))
+                }
+
+                conn.inputStream.use {
+                    it.readBytes()
+                }
+
                 conn.disconnect()
             } catch (_: Exception) {
-                // First version is deliberately fail-silent: no transaction is created
-                // if the endpoint is unreachable.
+                // First version is deliberately fail-silent:
+                // no transaction is created if the endpoint is unreachable.
             }
         }
     }
 
-    private fun quote(value: String): String =
-        """ + value.replace("\", "\\").replace(""", "\"")
-            .replace("
-", "\n").replace("", "\r") + """
+    private fun quote(value: String): String {
+        return "\"" +
+            value
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r") +
+            "\""
+    }
 }
