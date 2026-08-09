@@ -4,80 +4,371 @@ import android.app.Notification
 import android.content.Context
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.regex.Pattern
 
 class MoneyNotificationListener : NotificationListenerService() {
 
-    private val seen = ConcurrentHashMap<String, Long>()
+    private val executor = Executors.newSingleThreadExecutor()
+
+    /*
+     * Stores recently captured transaction fingerprints.
+     *
+     * The important difference from the old version is that we do NOT use
+     * notification ID + post time as the duplicate key.
+     *
+     * Banks can send multiple notifications for the same transaction.
+     */
+    private val seenTransactions = ConcurrentHashMap<String, Long>()
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
+
         val n = sbn.notification ?: return
+
         val extras = n.extras ?: return
 
-        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
-        val text = buildString {
-            append(extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty())
-            val lines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
-            if (!lines.isNullOrEmpty()) {
-                append(" ")
-                append(lines.joinToString(" ") { it.toString() })
+        val title =
+            extras.getCharSequence(Notification.EXTRA_TITLE)
+                ?.toString()
+                .orEmpty()
+
+        val textLines = buildList {
+
+            append(
+                extras.getCharSequence(Notification.EXTRA_TEXT)
+                    ?.toString()
+                    .orEmpty()
+            )
+
+            append(
+                extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
+                    ?.toString()
+                    .orEmpty()
+            )
+
+            val lines =
+                extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
+
+            if (lines != null) {
+                append(
+                    lines.joinToString(" ") {
+                        it.toString()
+                    }
+                )
             }
-            val big = extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString().orEmpty()
-            if (big.isNotBlank()) {
-                append(" ")
-                append(big)
+        }
+            .filter {
+                it.isNotBlank()
             }
-        }.trim()
+            .joinToString(" ")
+            .trim()
 
-        if (!looksLikeTransaction(title, text)) return
+        val bigText =
+            extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
+                ?.toString()
+                .orEmpty()
 
-        val key = "${sbn.packageName}|${sbn.id}|${sbn.postTime}|${title}|${text}"
-        if (seen.putIfAbsent(key, System.currentTimeMillis()) != null) return
-
-        // Keep only a bounded in-memory cache.
-        if (seen.size > 300) {
-            val cutoff = System.currentTimeMillis() - 15 * 60 * 1000L
-            seen.entries.removeIf { it.value < cutoff }
+        if (bigText.isNotBlank()) {
+            // Keep big text available in the combined notification text.
         }
 
-        val prefs = getSharedPreferences("capture", Context.MODE_PRIVATE)
-        val endpoint = prefs.getString("endpoint", "").orEmpty()
-        val secret = prefs.getString("secret", "").orEmpty()
-        if (endpoint.isBlank() || secret.isBlank()) return
+        if (title.isBlank() && text.isBlank()) {
+            return
+        }
 
-        NotificationPoster.post(
-            context = this,
-            endpoint = endpoint,
-            secret = secret,
-            payload = TransactionPayload(
+        /*
+         * Ignore notifications that don't look like transactions.
+         */
+        if (!looksLikeTransaction(title, text)) {
+            return
+        }
+
+        /*
+         * Create a transaction fingerprint that does NOT depend on
+         * notification ID or notification post time.
+         *
+         * This is what prevents Kotak's duplicate notifications.
+         */
+        val transactionKey =
+            createTransactionKey(
                 packageName = sbn.packageName,
-                appName = title.ifBlank { sbn.packageName },
                 title = title,
-                text = text,
-                postedAt = sbn.postTime,
-                notificationKey = key
+                text = text
             )
+
+        /*
+         * Keep only a bounded in-memory cache.
+         *
+         * 2 minutes is long enough for two notifications belonging to
+         * the same transaction to arrive close together.
+         */
+        val now = System.currentTimeMillis()
+        val cutoff = now - (2 * 60 * 1000L)
+
+        seenTransactions.entries.removeIf {
+            it.value < cutoff
+        }
+
+        /*
+         * If this exact transaction was already processed recently,
+         * ignore the notification.
+         */
+        val previous = seenTransactions.putIfAbsent(
+            transactionKey,
+            now
         )
+
+        if (previous != null) {
+            return
+        }
+
+        /*
+         * Read endpoint and secret from app settings.
+         */
+        val prefs =
+            getSharedPreferences(
+                "capture",
+                Context.MODE_PRIVATE
+            )
+
+        val endpoint =
+            prefs.getString("endpoint", "").orEmpty()
+
+        val secret =
+            prefs.getString("secret", "").orEmpty()
+
+        if (endpoint.isBlank() || secret.isBlank()) {
+            return
+        }
+
+        /*
+         * Send the transaction to Google Apps Script.
+         */
+        executor.execute {
+
+            NotificationPoster.post(
+                context = this,
+                endpoint = endpoint,
+                secret = secret,
+                payload = TransactionPayload(
+                    packageName = sbn.packageName,
+                    appName =
+                        title.ifBlank {
+                            sbn.packageName
+                        },
+                    title = title,
+                    text = text,
+                    postedAt = sbn.postTime,
+                    notificationKey = transactionKey
+                )
+            )
+        }
     }
 
-    private fun looksLikeTransaction(title: String, text: String): Boolean {
-        val s = (title + " " + text).lowercase()
+    /*
+     * Creates a stable fingerprint for a transaction.
+     *
+     * We intentionally remove:
+     * - notification IDs
+     * - timestamps
+     * - changing balance numbers
+     * - reference numbers
+     *
+     * so two notifications generated by the bank for the same payment
+     * are much more likely to produce the same key.
+     */
+    private fun createTransactionKey(
+        packageName: String,
+        title: String,
+        text: String
+    ): String {
+
+        val combined =
+            "$title $text"
+                .lowercase(Locale.ROOT)
+                .replace(Regex("\\s+"), " ")
+                .trim()
 
         val amount =
+            extractAmount(combined)
+
+        val direction =
+            when {
+                containsAny(
+                    combined,
+                    listOf(
+                        "credited",
+                        "received",
+                        "received rs",
+                        "money received",
+                        "payment received",
+                        "credit"
+                    )
+                ) -> "credit"
+
+                containsAny(
+                    combined,
+                    listOf(
+                        "debited",
+                        "sent",
+                        "paid",
+                        "payment made",
+                        "money sent",
+                        "debit"
+                    )
+                ) -> "debit"
+
+                else -> "unknown"
+            }
+
+        /*
+         * Remove numbers that commonly change between duplicate
+         * notifications, such as:
+         *
+         * - balance
+         * - transaction reference
+         * - UTR
+         * - dates/times
+         *
+         * Keep the textual transaction information.
+         */
+        val normalizedText =
+            combined
+                .replace(
+                    Regex(
+                        "(?i)(utr|ref(?:erence)?|txn|transaction\\s*(?:id|no|number)?)[\\s:#-]*[a-z0-9-]+"
+                    ),
+                    ""
+                )
+                .replace(
+                    Regex(
+                        "(?i)(balance|bal|avl|available)\\s*(?:is|:)?\\s*(?:rs\\.?|₹)?\\s*[0-9,]+(?:\\.\\d{1,2})?"
+                    ),
+                    ""
+                )
+                .replace(
+                    Regex(
+                        "\\b\\d{1,2}[:/]\\d{1,2}(?::\\d{1,2})?\\b"
+                    ),
+                    ""
+                )
+                .replace(
+                    Regex(
+                        "\\b\\d{4,}\\b"
+                    ),
+                    ""
+                )
+                .replace(
+                    Regex("\\s+"),
+                    " "
+                )
+                .trim()
+
+        return buildString {
+
+            append(packageName)
+            append("|")
+            append(direction)
+            append("|")
+            append(amount ?: "no_amount")
+            append("|")
+            append(
+                normalizedText
+            )
+
+        }
+    }
+
+    private fun extractAmount(
+        text: String
+    ): String? {
+
+        /*
+         * Supports examples such as:
+         *
+         * ₹10
+         * Rs 10
+         * Rs. 10
+         * INR 10
+         * INR10
+         * ₹1,250.50
+         */
+        val pattern =
             Pattern.compile(
-                """(?:₹|rs\.?|inr)\s*[\d,]+(?:\.\d{1,2})?""",
+                "(?:₹|rs\\.?|inr)\\s*([0-9,]+(?:\\.\\d{1,2})?)",
                 Pattern.CASE_INSENSITIVE
-            ).matcher(s).find()
+            )
 
-        if (!amount) return false
+        val matcher =
+            pattern.matcher(text)
 
-        val moneyWords = listOf(
-            "debited", "credited", "debit", "credit", "paid", "payment",
-            "received", "sent", "spent", "transaction", "upi", "bank",
-            "account", "a/c", "transferred", "transfer"
-        )
+        if (matcher.find()) {
 
-        return moneyWords.any { s.contains(it) }
+            return matcher.group(1)
+                ?.replace(",", "")
+        }
+
+        return null
+    }
+
+    private fun containsAny(
+        text: String,
+        words: List<String>
+    ): Boolean {
+
+        return words.any {
+            text.contains(it)
+        }
+    }
+
+    private fun looksLikeTransaction(
+        title: String,
+        text: String
+    ): Boolean {
+
+        val s =
+            "$title $text"
+                .lowercase(Locale.ROOT)
+
+        val amountPattern =
+            Pattern.compile(
+                "(?:₹|rs\\.?|inr)\\s*[0-9,]+(?:\\.\\d{1,2})?",
+                Pattern.CASE_INSENSITIVE
+            )
+
+        val amountFound =
+            amountPattern
+                .matcher(s)
+                .find()
+
+        if (!amountFound) {
+            return false
+        }
+
+        val keywords =
+            listOf(
+                "debit",
+                "debited",
+                "credit",
+                "credited",
+                "received",
+                "sent",
+                "paid",
+                "payment",
+                "transaction",
+                "txn",
+                "upi",
+                "bank",
+                "transfer",
+                "a/c",
+                "account"
+            )
+
+        return keywords.any {
+            s.contains(it)
+        }
     }
 }
+
