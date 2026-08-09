@@ -9,9 +9,6 @@ import java.util.regex.Pattern
 
 class MoneyNotificationListener : NotificationListenerService() {
 
-    private val seenNotifications =
-        ConcurrentHashMap<String, Long>()
-
     private val recentTransactions =
         ConcurrentHashMap<String, Long>()
 
@@ -93,20 +90,20 @@ class MoneyNotificationListener : NotificationListenerService() {
                 ""
             )?.trim().orEmpty()
 
-        if (endpoint.isBlank() ||
+        if (
+            endpoint.isBlank() ||
             secret.isBlank()
         ) {
             return
         }
 
-        val now =
-            System.currentTimeMillis()
-
         /*
-         * Exact notification duplicate protection.
+         * IMPORTANT:
          *
-         * Two identical deliveries of the same
-         * Android notification will only be posted once.
+         * sbn.key identifies the Android notification itself.
+         *
+         * We persist this key so an old unread notification
+         * cannot create another transaction later.
          */
         val notificationKey =
             buildNotificationKey(
@@ -115,27 +112,26 @@ class MoneyNotificationListener : NotificationListenerService() {
                 text
             )
 
-        cleanupOldEntries(now)
-
-        if (
-            seenNotifications.putIfAbsent(
-                notificationKey,
-                now
-            ) != null
-        ) {
+        /*
+         * Permanent duplicate protection.
+         *
+         * This survives app restart and phone restart.
+         */
+        if (wasAlreadyProcessed(notificationKey)) {
             return
         }
+
+        val now =
+            System.currentTimeMillis()
+
+        cleanupOldEntries(now)
 
         /*
          * Cross-source duplicate protection.
          *
-         * Some banks send the same transaction through
-         * both their app notification and another
-         * notification channel.
-         *
-         * We use amount + debit/credit direction for a
-         * short window so the same transaction is not
-         * counted twice.
+         * Example:
+         * Same ₹10 transaction may arrive from two
+         * notification channels.
          */
         val amount =
             extractAmount(text)
@@ -146,7 +142,8 @@ class MoneyNotificationListener : NotificationListenerService() {
                 text
             )
 
-        if (amount != null &&
+        if (
+            amount != null &&
             direction.isNotBlank()
         ) {
             val transactionKey =
@@ -161,6 +158,11 @@ class MoneyNotificationListener : NotificationListenerService() {
                 previous != null &&
                 now - previous < DUPLICATE_WINDOW_MS
             ) {
+                /*
+                 * Mark this notification as processed too,
+                 * otherwise Android could repost it later.
+                 */
+                markAsProcessed(notificationKey)
                 return
             }
 
@@ -168,6 +170,17 @@ class MoneyNotificationListener : NotificationListenerService() {
                 transactionKey
             ] = now
         }
+
+        /*
+         * Mark BEFORE sending.
+         *
+         * NotificationPoster already handles offline
+         * storage through OfflineCaptureQueue.
+         *
+         * Therefore this notification is considered
+         * handled even when internet is unavailable.
+         */
+        markAsProcessed(notificationKey)
 
         NotificationPoster.post(
             context = this,
@@ -186,17 +199,22 @@ class MoneyNotificationListener : NotificationListenerService() {
         )
     }
 
+    /*
+     * Creates a stable identifier for the Android
+     * notification.
+     *
+     * sbn.key is preferred because it identifies
+     * the notification itself.
+     */
     private fun buildNotificationKey(
         sbn: StatusBarNotification,
         title: String,
         text: String
     ): String {
         return buildString {
+            append(sbn.key)
+            append("|")
             append(sbn.packageName)
-            append("|")
-            append(sbn.id)
-            append("|")
-            append(sbn.postTime)
             append("|")
             append(title)
             append("|")
@@ -204,15 +222,77 @@ class MoneyNotificationListener : NotificationListenerService() {
         }
     }
 
+    /*
+     * Check persistent storage.
+     */
+    private fun wasAlreadyProcessed(
+        key: String
+    ): Boolean {
+        val prefs =
+            getSharedPreferences(
+                PROCESSED_PREFS,
+                Context.MODE_PRIVATE
+            )
+
+        val processed =
+            prefs.getStringSet(
+                PROCESSED_KEYS,
+                emptySet()
+            ) ?: emptySet()
+
+        return processed.contains(key)
+    }
+
+    /*
+     * Permanently remember that this notification
+     * has already been handled.
+     */
+    private fun markAsProcessed(
+        key: String
+    ) {
+        val prefs =
+            getSharedPreferences(
+                PROCESSED_PREFS,
+                Context.MODE_PRIVATE
+            )
+
+        val processed =
+            prefs.getStringSet(
+                PROCESSED_KEYS,
+                emptySet()
+            )?.toMutableSet()
+                ?: mutableSetOf()
+
+        processed.add(key)
+
+        /*
+         * Keep the stored list bounded.
+         *
+         * We don't need thousands of old notification
+         * records forever.
+         */
+        val limited =
+            if (processed.size > MAX_PROCESSED_KEYS) {
+                processed
+                    .takeLast(MAX_PROCESSED_KEYS)
+                    .toSet()
+            } else {
+                processed
+            }
+
+        prefs.edit()
+            .putStringSet(
+                PROCESSED_KEYS,
+                limited
+            )
+            .apply()
+    }
+
     private fun cleanupOldEntries(
         now: Long
     ) {
         val cutoff =
             now - CACHE_WINDOW_MS
-
-        seenNotifications.entries.removeIf {
-            it.value < cutoff
-        }
 
         recentTransactions.entries.removeIf {
             it.value < cutoff
@@ -283,7 +363,9 @@ class MoneyNotificationListener : NotificationListenerService() {
             "$title $text"
                 .lowercase()
 
-        if (extractAmount(text) == null) {
+        if (
+            extractAmount(text) == null
+        ) {
             return false
         }
 
@@ -340,10 +422,28 @@ class MoneyNotificationListener : NotificationListenerService() {
     }
 
     companion object {
+
         private const val CACHE_WINDOW_MS =
             15 * 60 * 1000L
 
         private const val DUPLICATE_WINDOW_MS =
             60 * 1000L
+
+        /*
+         * SharedPreferences used for permanent
+         * notification duplicate protection.
+         */
+        private const val PROCESSED_PREFS =
+            "processed_notifications"
+
+        private const val PROCESSED_KEYS =
+            "keys"
+
+        /*
+         * Prevent SharedPreferences from growing
+         * indefinitely.
+         */
+        private const val MAX_PROCESSED_KEYS =
+            1000
     }
 }
